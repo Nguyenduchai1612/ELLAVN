@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useReducer, useMemo, useState, useRef, useCallback, useEffect } from "react";
+import React, { createContext, useContext, useReducer, useMemo, useState, useRef, useCallback } from "react";
 import * as XLSX from "xlsx";
 import {
   ComposedChart, Bar, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid,
@@ -150,6 +150,15 @@ const COLUMN_ALIASES = {
   returnReason: ["return reason", "lý do hoàn", "ly do hoan", "lý do trả hàng", "ly do tra hang"],
   skuType: ["loại sku", "loai sku", "loại", "loai", "type", "phân loại", "phan loai"],
   cogs: ["giá vốn", "gia von", "cogs", "cost of goods", "gia von don vi"],
+  // "Giá bán lẻ (Nội tệ)"/"price" trong file Batch Edit Template — giá NIÊM YẾT
+  // trên gian hàng, KHÁC với "cogs" (giá vốn nhập hàng). Lưu lại để dùng cho
+  // tính năng gợi ý giá bán sau này, không hiển thị thêm cột trong bảng SKU
+  // (bảng SKU chỉ giữ đúng 4 cột: SKU / Tên SP / Tồn kho / Giá vốn).
+  // "price" là header tiếng Anh THẬT của cột giá bán trong file Batch Edit
+  // Template (Tiktoksellercenter_batchedit_...) — trước đây chỉ có các alias
+  // dài ("selling price"...) nên không khớp được với header ngắn "price",
+  // khiến giá bán luôn bị đọc = 0đ dù file có dữ liệu thật.
+  sellingPrice: ["giá bán lẻ", "gia ban le", "retail price", "selling price", "listing price", "price", "giá bán"],
   // Cột "quantity"/"Số lượng" trong file Batch Edit Template (Tiktoksellercenter_batchedit...)
   // của Seller Center — dùng để cảnh báo tồn kho thấp ở trang Sản phẩm.
   stockQty: ["quantity", "số lượng", "so luong", "available stock", "tồn kho", "ton kho", "lượng tồn kho", "luong ton kho"],
@@ -480,6 +489,25 @@ function parseReturnsRows(headers, rows) {
  * sku_id, price, quantity, seller_sku) — loại file này KHÔNG có cột giá vốn
  * nên hệ thống tạm đặt = 0đ, người dùng chỉnh sửa trực tiếp trong Config Center.
  */
+// Các cụm từ chắc chắn là VĂN BẢN HƯỚNG DẪN/METADATA của file Batch Edit
+// Template TikTok Seller Center (dòng 2-5: dòng "V4/All_Information/metric",
+// dòng nhãn tiếng Việt, dòng "Bắt buộc/Không bắt buộc", dòng "Không thể
+// chỉnh sửa/hướng dẫn nhập liệu") — KHÔNG phải dữ liệu SKU thật.
+const SKU_JUNK_MARKERS = [
+  "không thể chỉnh sửa", "khong the chinh sua",
+  "bắt buộc", "bat buoc",
+  "không bắt buộc", "khong bat buoc",
+  "metric", "all_information",
+  "sku người bán", "sku nguoi ban",
+  "mã nhận dạng sản phẩm", "ma nhan dang san pham",
+];
+function isJunkSkuRow(sellerSkuRaw) {
+  const s = String(sellerSkuRaw ?? "").trim();
+  if (!s) return true; // seller_sku rỗng -> chắc chắn không phải dòng dữ liệu
+  const norm = normalizeHeader(s);
+  return SKU_JUNK_MARKERS.some((m) => norm.includes(m));
+}
+
 function parseSkuConfigRows(headers, rows) {
   const map = buildHeaderMap(headers);
   const warnings = [];
@@ -493,14 +521,18 @@ function parseSkuConfigRows(headers, rows) {
   }
   const entries = [];
   const seen = new Set();
+  let skippedJunkRows = 0;
   rows.forEach((row) => {
     const sku = String(row[map.sellerSku] ?? "").trim();
-    if (!sku) return;
-    // Lọc dòng "mô tả cột"/metadata: nếu có cột SKU ID thì dòng dữ liệu thật
-    // luôn có SKU ID là chuỗi số thuần.
+    // Lớp lọc 1: kiểm tra trực tiếp nội dung ô seller_sku — bắt các dòng
+    // rác/hướng dẫn của Batch Edit Template ("Không thể chỉnh sửa", "Bắt
+    // buộc", "metric"...) ngay cả khi file không có cột sku_id để đối chiếu.
+    if (isJunkSkuRow(sku)) { if (sku) skippedJunkRows++; return; }
+    // Lớp lọc 2 (dự phòng, khi có cột sku_id): dữ liệu SKU thật luôn có
+    // ID SKU là chuỗi số thuần; dòng mô tả/hướng dẫn thì không.
     if (map.skuId !== undefined) {
       const idVal = row[map.skuId];
-      if (!looksLikeNumericId(idVal)) return;
+      if (!looksLikeNumericId(idVal)) { skippedJunkRows++; return; }
     }
     const key = sku.toLowerCase();
     if (seen.has(key)) return; // giữ dòng xuất hiện đầu tiên cho mỗi SKU
@@ -510,10 +542,14 @@ function parseSkuConfigRows(headers, rows) {
     const rawType = map.skuType !== undefined ? String(row[map.skuType] ?? "") : "";
     const type = inferSkuType(rawType + " " + productName);
     const stockQty = map.stockQty !== undefined ? toNumber(row[map.stockQty]) : 0;
-    entries.push({ sku, type, name: productName, cogs, stockQty });
+    const sellingPrice = map.sellingPrice !== undefined ? toNumber(row[map.sellingPrice]) : 0;
+    entries.push({ sku, type, name: productName, cogs, stockQty, sellingPrice });
   });
   if (map.stockQty === undefined) {
     warnings.push("File không có cột 'Số lượng' (tồn kho) — cảnh báo tồn kho thấp sẽ không khả dụng cho các SKU import từ file này.");
+  }
+  if (skippedJunkRows > 0) {
+    warnings.push(`Đã tự động bỏ qua ${skippedJunkRows} dòng hướng dẫn/metadata của Batch Edit Template (không phải dữ liệu SKU thật).`);
   }
   return { entries, warnings, ok: true };
 }
@@ -16274,8 +16310,20 @@ function reducer(state, action) {
       // catalog lớn, TikTok chia trang), import file thứ 2 sẽ XÓA MẤT toàn bộ
       // SKU của file thứ 1. Nay GỘP theo SKU (key), file import sau chỉ cập
       // nhật/thêm SKU trùng tên, không xóa các SKU đã có từ file trước.
+      //
+      // ĐỒNG THỜI: file Batch Edit Template của TikTok KHÔNG có cột Giá vốn
+      // (chỉ có Tồn kho/Tên/Giá bán) nên parseSkuConfigRows luôn trả về
+      // cogs=0 cho các dòng này. Nếu ghi đè thẳng, mỗi lần import lại file
+      // tồn kho mới sẽ XÓA MẤT Giá vốn người dùng đã nhập tay trước đó. Vì
+      // vậy khi gộp: nếu bản ghi mới có cogs=0 nhưng SKU đã tồn tại với
+      // cogs>0, GIỮ NGUYÊN cogs cũ — chỉ cập nhật tồn kho/tên/giá bán mới.
       const merged = new Map(state.skuConfig[platform].map((e) => [e.sku.toLowerCase(), e]));
-      entries.forEach((e) => merged.set(e.sku.toLowerCase(), e));
+      entries.forEach((e) => {
+        const key = e.sku.toLowerCase();
+        const old = merged.get(key);
+        const cogs = e.cogs > 0 ? e.cogs : (old ? old.cogs : 0);
+        merged.set(key, { ...e, cogs });
+      });
       const list = Array.from(merged.values());
       const log = {
         id: uid("log"),
@@ -16319,6 +16367,40 @@ function reducer(state, action) {
       return { ...state, role: action.payload };
     case "SET_DATE_RANGE":
       return { ...state, dateRange: action.payload };
+    case "CLEAR_SKU_CONFIG": {
+      // Xóa riêng danh sách SKU & Tồn kho của 1 sàn — không đụng tới đơn
+      // hàng/Ads/SKU của sàn còn lại.
+      const { platform } = action.payload;
+      const log = {
+        id: uid("log"),
+        time: new Date().toLocaleString("vi-VN"),
+        type: "info",
+        message: `Đã xóa toàn bộ SKU & tồn kho của ${platformLabel(platform)}.`,
+      };
+      return { ...state, skuConfig: { ...state.skuConfig, [platform]: [] }, logs: [log, ...state.logs].slice(0, 50) };
+    }
+    case "CLEAR_ORDERS": {
+      // Xóa riêng đơn hàng + dữ liệu Đối soát/Quyết toán của 1 sàn (đơn hàng,
+      // phí sàn, trạng thái trả hàng đều nằm chung trong orders[platform]).
+      const { platform } = action.payload;
+      const log = {
+        id: uid("log"),
+        time: new Date().toLocaleString("vi-VN"),
+        type: "info",
+        message: `Đã xóa toàn bộ đơn hàng & dữ liệu Đối soát của ${platformLabel(platform)}.`,
+      };
+      return { ...state, orders: { ...state.orders, [platform]: [] }, logs: [log, ...state.logs].slice(0, 50) };
+    }
+    case "CLEAR_ADS": {
+      // Xóa dữ liệu chi phí quảng cáo (cả 2 sàn — Marketing hiển thị gộp).
+      const log = {
+        id: uid("log"),
+        time: new Date().toLocaleString("vi-VN"),
+        type: "info",
+        message: "Đã xóa toàn bộ dữ liệu chi phí quảng cáo (Ads).",
+      };
+      return { ...state, ads: { [PLATFORM.TIKTOK]: 0, [PLATFORM.SHOPEE]: 0 }, logs: [log, ...state.logs].slice(0, 50) };
+    }
     case "RESET_ALL":
       return {
         ...initialState,
@@ -17773,7 +17855,7 @@ function FeeConfigCenterTab() {
       <FeeConfigTable />
       <SettingsForm />
       <Card className="p-4">
-        <h3 className="text-sm font-semibold text-blue-950 mb-3 flex items-center gap-2"><Download size={15} /> Xuất báo cáo & dữ liệu</h3>
+        <h3 className="text-sm font-semibold text-blue-950 mb-3 flex items-center gap-2"><Download size={15} /> Xuất báo cáo</h3>
         <div className="flex flex-wrap gap-2">
           <button
             onClick={() => exportReportToExcel(state, allComputed, aggAll, aggByPlatform)}
@@ -17787,15 +17869,98 @@ function FeeConfigCenterTab() {
           >
             <RefreshCw size={15} /> Khôi phục dữ liệu TikTok ban đầu
           </button>
-          <button
-            onClick={() => { if (confirm("Xóa toàn bộ dữ liệu đơn hàng hiện có?")) dispatch({ type: "RESET_ALL" }); }}
-            className="flex items-center gap-1.5 border border-rose-200 text-rose-600 text-sm font-medium px-4 py-2 rounded-xl hover:bg-rose-50 transition"
-          >
-            <Trash2 size={15} /> Xóa toàn bộ dữ liệu
-          </button>
         </div>
       </Card>
+      <DataManagementPanel />
     </div>
+  );
+}
+
+/**
+ * Bảng "Quản lý & Xóa Dữ Liệu" — thay vì chỉ có 1 nút xóa tất cả, tách riêng
+ * từng nút theo đúng loại dữ liệu (SKU/Đơn hàng+Đối soát/Ads theo từng sàn)
+ * để người dùng xóa đúng phần cần làm sạch mà KHÔNG ảnh hưởng dữ liệu khác.
+ * Mỗi nút đều có Confirm Alert trước khi thực thi (không thể hoàn tác).
+ */
+function DataManagementPanel() {
+  const { state, dispatch } = useApp();
+  const isAdmin = state.role === "admin";
+
+  const actions = [
+    {
+      key: "sku-tiktok",
+      label: "Xóa SKU TikTok Shop",
+      desc: `${state.skuConfig[PLATFORM.TIKTOK].length} SKU hiện có — chỉ xóa danh sách SKU & tồn kho của TikTok.`,
+      confirmMsg: "Xóa toàn bộ danh sách SKU & tồn kho của TikTok Shop? Đơn hàng và dữ liệu Shopee sẽ KHÔNG bị ảnh hưởng.",
+      run: () => dispatch({ type: "CLEAR_SKU_CONFIG", payload: { platform: PLATFORM.TIKTOK } }),
+    },
+    {
+      key: "sku-shopee",
+      label: "Xóa SKU Shopee",
+      desc: `${state.skuConfig[PLATFORM.SHOPEE].length} SKU hiện có — chỉ xóa danh sách SKU & tồn kho của Shopee.`,
+      confirmMsg: "Xóa toàn bộ danh sách SKU & tồn kho của Shopee? Đơn hàng và dữ liệu TikTok sẽ KHÔNG bị ảnh hưởng.",
+      run: () => dispatch({ type: "CLEAR_SKU_CONFIG", payload: { platform: PLATFORM.SHOPEE } }),
+    },
+    {
+      key: "orders-tiktok",
+      label: "Xóa Đơn Hàng & Đối Soát TikTok",
+      desc: `${state.orders[PLATFORM.TIKTOK].length} đơn hiện có — chỉ xóa đơn hàng + dữ liệu Quyết toán/phí sàn của TikTok.`,
+      confirmMsg: "Xóa toàn bộ đơn hàng & dữ liệu Đối soát của TikTok Shop? SKU và dữ liệu Shopee sẽ KHÔNG bị ảnh hưởng.",
+      run: () => dispatch({ type: "CLEAR_ORDERS", payload: { platform: PLATFORM.TIKTOK } }),
+    },
+    {
+      key: "orders-shopee",
+      label: "Xóa Đơn Hàng & Đối Soát Shopee",
+      desc: `${state.orders[PLATFORM.SHOPEE].length} đơn hiện có — chỉ xóa đơn hàng + dữ liệu Quyết toán/phí sàn của Shopee.`,
+      confirmMsg: "Xóa toàn bộ đơn hàng & dữ liệu Đối soát của Shopee? SKU và dữ liệu TikTok sẽ KHÔNG bị ảnh hưởng.",
+      run: () => dispatch({ type: "CLEAR_ORDERS", payload: { platform: PLATFORM.SHOPEE } }),
+    },
+    {
+      key: "ads",
+      label: "Xóa Dữ Liệu Quảng Cáo (Ads)",
+      desc: `Tổng hiện có: ${formatVND(state.ads[PLATFORM.TIKTOK] + state.ads[PLATFORM.SHOPEE])} — chỉ xóa dữ liệu chi phí Ads, không ảnh hưởng đơn hàng/SKU.`,
+      confirmMsg: "Xóa toàn bộ dữ liệu chi phí quảng cáo (Ads) của cả 2 sàn?",
+      run: () => dispatch({ type: "CLEAR_ADS" }),
+    },
+  ];
+
+  return (
+    <Card className="p-4">
+      <h3 className="text-sm font-semibold text-blue-950 mb-1 flex items-center gap-2"><Trash2 size={15} /> Quản lý & Xóa Dữ Liệu</h3>
+      <p className="text-[11px] text-slate-400 mb-3">Xóa đúng phần dữ liệu cần làm sạch trước khi import lại — không ảnh hưởng các phần dữ liệu còn lại. Mỗi thao tác đều cần xác nhận và không thể hoàn tác.</p>
+      {!isAdmin ? (
+        <div className="text-xs text-slate-400 flex items-center gap-1.5"><Lock size={13} /> Chỉ tài khoản Admin mới có quyền xóa dữ liệu.</div>
+      ) : (
+        <div className="grid sm:grid-cols-2 gap-2.5">
+          {actions.map((a) => (
+            <div key={a.key} className="flex items-center justify-between gap-3 border border-slate-100 rounded-xl px-3 py-2.5">
+              <div className="min-w-0">
+                <div className="text-xs font-medium text-blue-950">{a.label}</div>
+                <div className="text-[11px] text-slate-400 truncate">{a.desc}</div>
+              </div>
+              <button
+                onClick={() => { if (confirm(a.confirmMsg)) a.run(); }}
+                className="shrink-0 flex items-center gap-1 text-xs font-medium border border-rose-200 text-rose-600 rounded-lg px-2.5 py-1.5 hover:bg-rose-50 transition"
+              >
+                <Trash2 size={12} /> Xóa
+              </button>
+            </div>
+          ))}
+          <div className="flex items-center justify-between gap-3 border border-rose-200 bg-rose-50/60 rounded-xl px-3 py-2.5 sm:col-span-2">
+            <div className="min-w-0">
+              <div className="text-xs font-semibold text-rose-700">Reset Toàn Bộ Hệ Thống</div>
+              <div className="text-[11px] text-rose-500/80">Xóa sạch TOÀN BỘ dữ liệu (SKU, đơn hàng, Ads của cả 2 sàn) về trạng thái mặc định trống.</div>
+            </div>
+            <button
+              onClick={() => { if (confirm("Xóa TOÀN BỘ dữ liệu hệ thống (SKU, đơn hàng, Ads của cả TikTok lẫn Shopee) và không thể hoàn tác?")) dispatch({ type: "RESET_ALL" }); }}
+              className="shrink-0 flex items-center gap-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold rounded-lg px-3 py-1.5 transition"
+            >
+              <Trash2 size={13} /> Reset toàn bộ
+            </button>
+          </div>
+        </div>
+      )}
+    </Card>
   );
 }
 
