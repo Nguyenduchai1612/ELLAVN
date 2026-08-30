@@ -114,6 +114,9 @@ function statusLabel(s) {
 
 const COLUMN_ALIASES = {
   orderId: ["order id", "mã đơn hàng", "order_id", "id đơn hàng", "ma don hang"],
+  // Cột "product_id"/"ID sản phẩm" trong file Batch Edit Template — dùng làm
+  // lớp lọc dòng rác/hướng dẫn thứ 2 (độc lập với cột seller_sku/sku_id).
+  productId: ["product id", "id sản phẩm", "id san pham"],
   // File Đối soát/Income của TikTok gộp chung nhiều LOẠI dòng trong cùng 1
   // sheet (đơn hàng thật, "GMV thanh toán cho Quảng cáo TikTok", điều chỉnh...).
   // Cột này giúp lọc ra CHỈ các dòng "Đơn hàng" thật, tránh đếm nhầm dòng
@@ -506,14 +509,27 @@ const SKU_JUNK_MARKERS = [
   "bắt buộc", "bat buoc",
   "không bắt buộc", "khong bat buoc",
   "metric", "all_information",
-  "sku người bán", "sku nguoi ban",
+  "sku người bán", "sku nguoi ban", "seller_sku",
   "mã nhận dạng sản phẩm", "ma nhan dang san pham",
+  "lượng hàng có sẵn", "luong hang co san",
+  "nhập giá của sản phẩm", "nhap gia cua san pham",
+];
+// Các cụm từ chắc chắn là RÁC khi xuất hiện trong cột product_id/ID sản phẩm.
+const PRODUCT_ID_JUNK_MARKERS = [
+  "product_id", "id sản phẩm", "id san pham", "v4",
+  "bắt buộc", "bat buoc", "không thể chỉnh sửa", "khong the chinh sua",
 ];
 function isJunkSkuRow(sellerSkuRaw) {
   const s = String(sellerSkuRaw ?? "").trim();
   if (!s) return true; // seller_sku rỗng -> chắc chắn không phải dòng dữ liệu
   const norm = normalizeHeader(s);
   return SKU_JUNK_MARKERS.some((m) => norm.includes(m));
+}
+function isJunkProductIdRow(productIdRaw) {
+  const s = String(productIdRaw ?? "").trim();
+  if (!s) return false; // rỗng không tự nó là dấu hiệu rác cho cột này
+  const norm = normalizeHeader(s);
+  return PRODUCT_ID_JUNK_MARKERS.some((m) => norm.includes(m));
 }
 
 function parseSkuConfigRows(headers, rows) {
@@ -536,7 +552,12 @@ function parseSkuConfigRows(headers, rows) {
     // rác/hướng dẫn của Batch Edit Template ("Không thể chỉnh sửa", "Bắt
     // buộc", "metric"...) ngay cả khi file không có cột sku_id để đối chiếu.
     if (isJunkSkuRow(sku)) { if (sku) skippedJunkRows++; return; }
-    // Lớp lọc 2 (dự phòng, khi có cột sku_id): dữ liệu SKU thật luôn có
+    // Lớp lọc 2: kiểm tra thêm cột product_id (ID sản phẩm) nếu có — dòng dữ
+    // liệu rác thường chứa "product_id", "ID sản phẩm", "V4", "Bắt buộc",
+    // "Không thể chỉnh sửa" ở CẢ 2 cột cùng lúc, nên kiểm tra thêm cột này
+    // giúp bắt chắc chắn hơn, không phụ thuộc hoàn toàn vào 1 cột duy nhất.
+    if (map.productId !== undefined && isJunkProductIdRow(row[map.productId])) { skippedJunkRows++; return; }
+    // Lớp lọc 3 (dự phòng, khi có cột sku_id): dữ liệu SKU thật luôn có
     // ID SKU là chuỗi số thuần; dòng mô tả/hướng dẫn thì không.
     if (map.skuId !== undefined) {
       const idVal = row[map.skuId];
