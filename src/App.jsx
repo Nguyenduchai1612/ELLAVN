@@ -64,7 +64,7 @@ import {
 
 const PLATFORM = { TIKTOK: "tiktok", SHOPEE: "shopee" };
 const STATUS = { SUCCESS: "success", CANCELLED: "cancelled", RETURNED: "returned" };
-const DEFAULT_PACKAGING_FEE = 6000;
+const DEFAULT_PACKAGING_FEE = 1000;
 
 const COLORS = {
   navy: "#0c2d55",
